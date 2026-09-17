@@ -21,6 +21,7 @@ int parallel = 1;
 int fill = 0;
 int holdSeconds = 600;
 int roundIntervalMs = 0;
+string? control = null;
 string uri = "icerpc://build-telemetry.icerpc.dev";
 for (int i = 0; i < args.Length; i++)
 {
@@ -50,10 +51,51 @@ for (int i = 0; i < args.Length; i++)
         case "--round-interval":
             roundIntervalMs = int.Parse(args[++i], CultureInfo.InvariantCulture);
             break;
+        case "--control":
+            control = args[++i];
+            break;
         default:
             Console.Error.WriteLine($"unknown argument: {args[i]}");
             return 2;
     }
+}
+
+// A bare QUIC handshake to somewhere else entirely, to tell our server's path apart from the runner's UDP egress.
+if (control is not null)
+{
+    string[] parts = control.Split(':');
+    string host = parts[0];
+    int controlPort = parts.Length > 1 ? int.Parse(parts[1], CultureInfo.InvariantCulture) : 443;
+    string start = DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
+    var watch = Stopwatch.StartNew();
+    string result = "ok";
+    string error = "";
+    try
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
+        await using QuicConnection connection = await QuicConnection.ConnectAsync(
+            new QuicClientConnectionOptions
+            {
+                RemoteEndPoint = new DnsEndPoint(host, controlPort),
+                DefaultCloseErrorCode = 0,
+                DefaultStreamErrorCode = 0,
+                ClientAuthenticationOptions = new SslClientAuthenticationOptions
+                {
+                    TargetHost = host,
+                    ApplicationProtocols = [new SslApplicationProtocol("h3")],
+                },
+            },
+            cts.Token);
+        await connection.CloseAsync(0, cts.Token);
+    }
+    catch (Exception exception)
+    {
+        result = "FAIL";
+        error = Describe(exception);
+    }
+
+    Console.WriteLine($"CONTROL target={control} start={start} total_ms={watch.ElapsedMilliseconds} result={result} error=\"{error}\"");
+    return result == "ok" ? 0 : 1;
 }
 
 if (fill > 0)
