@@ -11,10 +11,11 @@ using System.Net.Quic;
 using System.Net.Security;
 
 // Connects to the build-telemetry server the way the build-telemetry generator does, then closes the connection,
-// printing one line per attempt with the time each phase took.
+// printing one line per attempt with the time each phase took. Each round opens --parallel connections at once.
 bool tcp = false;
 int timeoutSeconds = 60;
 int count = 1;
+int parallel = 1;
 string uri = "icerpc://build-telemetry.icerpc.dev";
 for (int i = 0; i < args.Length; i++)
 {
@@ -29,6 +30,9 @@ for (int i = 0; i < args.Length; i++)
         case "--count":
             count = int.Parse(args[++i], CultureInfo.InvariantCulture);
             break;
+        case "--parallel":
+            parallel = int.Parse(args[++i], CultureInfo.InvariantCulture);
+            break;
         case "--uri":
             uri = args[++i];
             break;
@@ -39,7 +43,22 @@ for (int i = 0; i < args.Length; i++)
 }
 
 int failures = 0;
-for (int i = 0; i < count; i++)
+for (int round = 0; round < count; round++)
+{
+    string[] lines = await Task.WhenAll(Enumerable.Range(0, parallel).Select(_ => AttemptAsync(uri, tcp, timeoutSeconds)));
+    foreach (string line in lines)
+    {
+        Console.WriteLine(line);
+        if (line.Contains("result=FAIL"))
+        {
+            failures++;
+        }
+    }
+}
+
+return failures == 0 ? 0 : 1;
+
+static async Task<string> AttemptAsync(string uri, bool tcp, int timeoutSeconds)
 {
     string start = DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);
     var timings = new List<string>();
@@ -53,15 +72,11 @@ for (int i = 0; i < count; i++)
     catch (Exception exception)
     {
         result = "FAIL";
-        failures++;
         error = Describe(exception);
     }
 
-    Console.WriteLine(
-        $"PROBE start={start} total_ms={total.ElapsedMilliseconds} {string.Join(' ', timings)} result={result} error=\"{error}\"");
+    return $"PROBE start={start} total_ms={total.ElapsedMilliseconds} {string.Join(' ', timings)} result={result} error=\"{error}\"";
 }
-
-return failures == 0 ? 0 : 1;
 
 static async Task ConnectAndCloseAsync(string uri, bool tcp, int timeoutSeconds, List<string> timings)
 {
