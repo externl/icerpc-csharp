@@ -5,16 +5,29 @@ name: Telemetry hammer
 # hits about once in 80 runs.
 
 on:
-  push:
-    branches: [telemetry-hammer]
   workflow_dispatch:
     inputs:
       minutes:
         description: How long to hammer
         default: "240"
+      runners:
+        description: JSON list of runner labels
+        default: '["ubuntu-24.04", "macos-26", "windows-2025-vs2026"]'
       interval:
         description: Seconds to wait between builds
         default: "2"
+      probe_streams:
+        description: Concurrent probe processes per runner
+        default: "2"
+      probe_parallel:
+        description: Connections each probe process opens at once
+        default: "1"
+      probe_rounds:
+        description: Rounds per probe process
+        default: "1"
+      probe_interval:
+        description: Seconds between probe processes in a stream
+        default: "0.5"
 
 env:
   IceRpcBuildTelemetryDebug: true
@@ -25,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-26, windows-2025-vs2026]
+        os: ${{ fromJSON(inputs.runners) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 350
     steps:
@@ -75,8 +88,8 @@ jobs:
         shell: bash
       - name: Hammer
         env:
-          MINUTES: ${{ inputs.minutes || 30 }}
-          INTERVAL: ${{ inputs.interval || 2 }}
+          MINUTES: ${{ inputs.minutes }}
+          INTERVAL: ${{ inputs.interval }}
         run: |
           set -u
           now() { perl -MTime::HiRes=time -MPOSIX=strftime -e '$t=time; printf("%s.%03dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime($t)), ($t-int($t))*1000)'; }
@@ -132,7 +145,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-26, windows-2025-vs2026]
+        os: ${{ fromJSON(inputs.runners) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 350
     steps:
@@ -171,37 +184,42 @@ jobs:
         shell: pwsh
       - name: Probe
         env:
-          MINUTES: ${{ inputs.minutes || 30 }}
-          PARALLEL: "4"
-          ROUNDS: "10"
-          INTERVAL: "1"
+          MINUTES: ${{ inputs.minutes }}
+          STREAMS: ${{ inputs.probe_streams }}
+          PARALLEL: ${{ inputs.probe_parallel }}
+          ROUNDS: ${{ inputs.probe_rounds }}
+          INTERVAL: ${{ inputs.probe_interval }}
         run: |
           set -u
           probe="dotnet src/IceRpc.BuildTelemetry.Probe/bin/Debug/net10.0/IceRpc.BuildTelemetry.Probe.dll"
           log="$RUNNER_TEMP/probe.log"
           failures="$RUNNER_TEMP/probe-failures.log"
-          out="$RUNNER_TEMP/probe-out.txt"
           : > "$log"; : > "$failures"
           end=$(( $(date +%s) + MINUTES * 60 ))
-          # Each process runs ROUNDS rounds of PARALLEL concurrent connect-and-close, then exits. A failed or slow
-          # connect is followed at once by fresh single QUIC flows, a TCP connect, and pings, to tell a dead flow
-          # from a dead path from a dead transport.
-          while [ "$(date +%s)" -lt "$end" ]; do
-            $probe --timeout 60 --parallel "$PARALLEL" --count "$ROUNDS" > "$out" 2>&1 || true
-            cat "$out" >> "$log"
-            if bad=$(grep -E 'result=FAIL|connect_ms=([2-9][0-9]{3}|[0-9]{5,})' "$out"); then
-              echo "::warning::probe: $(printf '%s' "$bad" | head -1)"
-              {
-                printf '=== %s\n' "$bad"
-                for _ in 1 2 3; do $probe --timeout 60 & done
-                $probe --timeout 60 --transport tcp &
-                if [ "$RUNNER_OS" = Windows ]; then ping -n 3 build-telemetry.icerpc.dev & else ping -c 3 build-telemetry.icerpc.dev & fi
-                wait
-                echo
-              } >> "$failures" 2>&1
-            fi
-            sleep "$INTERVAL"
-          done
+          # STREAMS concurrent streams; each process runs ROUNDS rounds of PARALLEL concurrent connect-and-close, then
+          # exits. A failed or slow connect is followed at once by fresh single QUIC flows, a TCP connect, and pings,
+          # to tell a dead flow from a dead path from a dead transport.
+          stream() {
+            out="$RUNNER_TEMP/probe-out.$1.txt"
+            while [ "$(date +%s)" -lt "$end" ]; do
+              $probe --timeout 60 --parallel "$PARALLEL" --count "$ROUNDS" > "$out" 2>&1 || true
+              cat "$out" >> "$log"
+              if bad=$(grep -E 'result=FAIL|connect_ms=([2-9][0-9]{3}|[0-9]{5,})' "$out"); then
+                echo "::warning::probe: $(printf '%s' "$bad" | head -1)"
+                {
+                  printf '=== %s\n' "$bad"
+                  for _ in 1 2 3; do $probe --timeout 60 & done
+                  $probe --timeout 60 --transport tcp &
+                  if [ "$RUNNER_OS" = Windows ]; then ping -n 3 build-telemetry.icerpc.dev & else ping -c 3 build-telemetry.icerpc.dev & fi
+                  wait
+                  echo
+                } >> "$failures" 2>&1
+              fi
+              sleep "$INTERVAL"
+            done
+          }
+          for s in $(seq 1 "$STREAMS"); do stream "$s" & done
+          wait
           echo "attempts=$(grep -c '^PROBE' "$log") failed=$(grep -c 'result=FAIL' "$log")"
           [ "$(grep -c 'result=FAIL' "$log")" -eq 0 ]
         shell: bash
