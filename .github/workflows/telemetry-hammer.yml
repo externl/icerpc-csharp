@@ -47,6 +47,16 @@ jobs:
           sleep 1
           cat "$RUNNER_TEMP/tcpdump.log"
         shell: bash
+      - name: Warm up and verify debug mode
+        run: |
+          IceRpcVersion=$(sed -n 's/.*<Version[^>]*>\(.*\)<\/Version>.*/\1/p' build/IceRpc.Version.props)
+          echo "IceRpcVersion=$IceRpcVersion" >> "$GITHUB_ENV"
+          export IceRpcVersion
+          dotnet build examples/protobuf/MultipleServices/MultipleServices.slnx
+          # The generator writes this file only in debug mode, the mode in which a failed report fails the build.
+          find examples/protobuf/MultipleServices -name '*.BuildTelemetry.txt' | grep -q . \
+            || { echo "::error::build telemetry is not running in debug mode"; exit 1; }
+        shell: bash
       - name: Hammer
         env:
           MINUTES: ${{ inputs.minutes || 30 }}
@@ -54,8 +64,6 @@ jobs:
         run: |
           set -u
           now() { perl -MTime::HiRes=time -MPOSIX=strftime -e '$t=time; printf("%s.%03dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime($t)), ($t-int($t))*1000)'; }
-          IceRpcVersion=$(sed -n 's/.*<Version[^>]*>\(.*\)<\/Version>.*/\1/p' build/IceRpc.Version.props)
-          export IceRpcVersion
           solution=examples/protobuf/MultipleServices/MultipleServices.slnx
           log="$RUNNER_TEMP/hammer.log"
           failures="$RUNNER_TEMP/failures.log"
