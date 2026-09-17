@@ -20,6 +20,7 @@ int count = 1;
 int parallel = 1;
 int fill = 0;
 int holdSeconds = 600;
+int roundIntervalMs = 0;
 string uri = "icerpc://build-telemetry.icerpc.dev";
 for (int i = 0; i < args.Length; i++)
 {
@@ -46,6 +47,9 @@ for (int i = 0; i < args.Length; i++)
         case "--hold":
             holdSeconds = int.Parse(args[++i], CultureInfo.InvariantCulture);
             break;
+        case "--round-interval":
+            roundIntervalMs = int.Parse(args[++i], CultureInfo.InvariantCulture);
+            break;
         default:
             Console.Error.WriteLine($"unknown argument: {args[i]}");
             return 2;
@@ -59,6 +63,7 @@ if (fill > 0)
 }
 
 int failures = 0;
+DateTime first = DateTime.UtcNow;
 for (int round = 0; round < count; round++)
 {
     string[] lines = await Task.WhenAll(Enumerable.Range(0, parallel).Select(_ => AttemptAsync(uri, tcp, timeoutSeconds)));
@@ -68,6 +73,16 @@ for (int round = 0; round < count; round++)
         if (line.Contains("result=FAIL"))
         {
             failures++;
+        }
+    }
+
+    // Start rounds on a fixed cadence, so the connection rate stays put as the burst size changes.
+    if (roundIntervalMs > 0)
+    {
+        TimeSpan delay = first.AddMilliseconds((double)roundIntervalMs * (round + 1)) - DateTime.UtcNow;
+        if (delay > TimeSpan.Zero)
+        {
+            await Task.Delay(delay);
         }
     }
 }

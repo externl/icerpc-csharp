@@ -31,6 +31,15 @@ on:
       probe_fill:
         description: Idle UDP flows to hold open beside the probe, to occupy NAT mappings
         default: "0"
+      jobs:
+        description: Which jobs to run — hammer, probe, burst
+        default: "hammer,probe"
+      burst_rate:
+        description: burst job — connections per second, held constant across phases
+        default: "5"
+      burst_sizes:
+        description: burst job — burst sizes to walk, in order
+        default: "1 2 3 4 5 6"
 
 env:
   IceRpcBuildTelemetryDebug: true
@@ -38,6 +47,7 @@ env:
 
 jobs:
   hammer:
+    if: contains(inputs.jobs, 'hammer')
     strategy:
       fail-fast: false
       matrix:
@@ -145,6 +155,7 @@ jobs:
             ${{ runner.temp }}/tcpdump.log
 
   probe:
+    if: contains(inputs.jobs, 'probe')
     strategy:
       fail-fast: false
       matrix:
@@ -255,4 +266,89 @@ jobs:
             ${{ runner.temp }}/probe.log
             ${{ runner.temp }}/probe-failures.log
             ${{ runner.temp }}/fill.log
+            ${{ runner.temp }}/tcpdump.log
+
+  burst:
+    if: contains(inputs.jobs, 'burst')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.runners) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: ./.github/actions/setup-dotnet
+      - name: Build the probe
+        run: dotnet build src/IceRpc.BuildTelemetry.Probe
+      - name: Describe the network
+        run: |
+          echo "egress IP: $(curl -fsS https://checkip.amazonaws.com)"
+          echo "target:    build-telemetry.icerpc.dev -> $(dig +short build-telemetry.icerpc.dev A 2>/dev/null | tr '\n' ' ')"
+          case "$RUNNER_OS" in
+            Linux) dpkg -s libmsquic | grep '^Version' ;;
+            macOS) brew list --versions libmsquic ;;
+            Windows) ls "$DOTNET_ROOT"/shared/Microsoft.NETCore.App/*/msquic.dll ;;
+          esac
+        shell: bash
+      - name: Start packet capture
+        if: runner.os != 'Windows'
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then iface=any; else iface=$(route -n get default | awk '/interface:/{print $2}'); fi
+          sudo sh -c "tcpdump -i $iface -nn -s 120 -U -Z root -w $RUNNER_TEMP/burst.pcap 'port 4062 or port 53 or icmp' >$RUNNER_TEMP/tcpdump.log 2>&1 &"
+          sleep 1
+          cat "$RUNNER_TEMP/tcpdump.log"
+        shell: bash
+      - name: Start packet capture (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pktmon filter remove
+          pktmon filter add -p 4062
+          pktmon filter add -p 53
+          pktmon filter add -t icmp
+          pktmon start --capture --pkt-size 120 --file-name "$env:RUNNER_TEMP\burst.etl"
+        shell: pwsh
+      - name: Walk the burst sizes
+        env:
+          MINUTES: ${{ inputs.minutes }}
+          RATE: ${{ inputs.burst_rate }}
+          SIZES: ${{ inputs.burst_sizes }}
+        run: |
+          set -u
+          probe="dotnet src/IceRpc.BuildTelemetry.Probe/bin/Debug/net10.0/IceRpc.BuildTelemetry.Probe.dll"
+          log="$RUNNER_TEMP/burst.log"
+          : > "$log"
+          # One phase per burst size, in sequence on this one runner. The round cadence is scaled by the burst size,
+          # so every phase opens the same connections per second and only the burst size differs.
+          set -- $SIZES
+          phase_minutes=$(( MINUTES / $# ))
+          for burst in $SIZES; do
+            interval=$(( burst * 1000 / RATE ))
+            rounds=$(( phase_minutes * 60 * 1000 / interval ))
+            echo "PHASE burst=$burst interval_ms=$interval rounds=$rounds rate=$RATE start=$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$log"
+            $probe --timeout 60 --parallel "$burst" --count "$rounds" --round-interval "$interval" >> "$log" 2>&1 || true
+          done
+          echo "=== per phase ==="
+          awk '/^PHASE/{b=$2; a[b]=0; f[b]=0; order[++n]=b} /^PROBE/{a[b]++; if ($0 ~ /result=FAIL/) f[b]++} END {for (i=1;i<=n;i++) printf "  %s attempts=%d failed=%d\n", order[i], a[order[i]], f[order[i]]}' "$log"
+        shell: bash
+      - name: Stop packet capture
+        if: always() && runner.os != 'Windows'
+        run: sudo pkill -INT tcpdump || true
+        shell: bash
+      - name: Stop packet capture (Windows)
+        if: always() && runner.os == 'Windows'
+        run: |
+          pktmon stop
+          pktmon etl2pcap "$env:RUNNER_TEMP\burst.etl" --out "$env:RUNNER_TEMP\burst.pcap"
+        shell: pwsh
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: burst-${{ matrix.os }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/burst.pcap
+            ${{ runner.temp }}/burst.log
             ${{ runner.temp }}/tcpdump.log
