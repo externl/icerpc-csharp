@@ -7,7 +7,9 @@ using IceRpc.Transports.Slic;
 using IceRpc.Transports.Tcp;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
 using System.Net.Quic;
+using System.Net.Sockets;
 using System.Net.Security;
 
 // Connects to the build-telemetry server the way the build-telemetry generator does, then closes the connection,
@@ -16,6 +18,8 @@ bool tcp = false;
 int timeoutSeconds = 60;
 int count = 1;
 int parallel = 1;
+int fill = 0;
+int holdSeconds = 600;
 string uri = "icerpc://build-telemetry.icerpc.dev";
 for (int i = 0; i < args.Length; i++)
 {
@@ -36,10 +40,22 @@ for (int i = 0; i < args.Length; i++)
         case "--uri":
             uri = args[++i];
             break;
+        case "--fill":
+            fill = int.Parse(args[++i], CultureInfo.InvariantCulture);
+            break;
+        case "--hold":
+            holdSeconds = int.Parse(args[++i], CultureInfo.InvariantCulture);
+            break;
         default:
             Console.Error.WriteLine($"unknown argument: {args[i]}");
             return 2;
     }
+}
+
+if (fill > 0)
+{
+    await FillAsync(uri, fill, holdSeconds);
+    return 0;
 }
 
 int failures = 0;
@@ -101,6 +117,35 @@ static async Task ConnectAndCloseAsync(string uri, bool tcp, int timeoutSeconds,
     phase.Restart();
     await connection.ShutdownAsync();
     timings.Add($"shutdown_ms={phase.ElapsedMilliseconds}");
+}
+
+// Occupies NAT mappings without QUIC: one datagram from each of `count` sockets, re-sent every 200 s so the mappings
+// outlive Azure's 4-minute idle timeout, for `holdSeconds`.
+static async Task FillAsync(string uri, int count, int holdSeconds)
+{
+    var serverUri = new Uri(uri);
+    IPAddress address = (await Dns.GetHostAddressesAsync(serverUri.Host, AddressFamily.InterNetwork))[0];
+    var endpoint = new IPEndPoint(address, serverUri.IsDefaultPort ? 4062 : serverUri.Port);
+    var sockets = new List<Socket>();
+    for (int i = 0; i < count; i++)
+    {
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        socket.Connect(endpoint);
+        sockets.Add(socket);
+    }
+
+    var deadline = DateTime.UtcNow.AddSeconds(holdSeconds);
+    byte[] payload = [0];
+    do
+    {
+        foreach (Socket socket in sockets)
+        {
+            socket.Send(payload);
+        }
+        Console.WriteLine($"FILL sockets={sockets.Count} sent={DateTime.UtcNow:HH:mm:ss}Z");
+        await Task.Delay(TimeSpan.FromSeconds(Math.Min(200, Math.Max(1, (deadline - DateTime.UtcNow).TotalSeconds))));
+    }
+    while (DateTime.UtcNow < deadline);
 }
 
 static string Describe(Exception exception)

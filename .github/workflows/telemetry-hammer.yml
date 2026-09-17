@@ -28,6 +28,9 @@ on:
       probe_interval:
         description: Seconds between probe processes in a stream
         default: "0.5"
+      probe_fill:
+        description: Idle UDP flows to hold open beside the probe, to occupy NAT mappings
+        default: "0"
 
 env:
   IceRpcBuildTelemetryDebug: true
@@ -189,9 +192,14 @@ jobs:
           PARALLEL: ${{ inputs.probe_parallel }}
           ROUNDS: ${{ inputs.probe_rounds }}
           INTERVAL: ${{ inputs.probe_interval }}
+          FILL: ${{ inputs.probe_fill }}
         run: |
           set -u
           probe="dotnet src/IceRpc.BuildTelemetry.Probe/bin/Debug/net10.0/IceRpc.BuildTelemetry.Probe.dll"
+          if [ "$FILL" -gt 0 ]; then
+            $probe --fill "$FILL" --hold $((MINUTES * 60 + 120)) > "$RUNNER_TEMP/fill.log" 2>&1 &
+            sleep 5; cat "$RUNNER_TEMP/fill.log"
+          fi
           log="$RUNNER_TEMP/probe.log"
           failures="$RUNNER_TEMP/probe-failures.log"
           : > "$log"; : > "$failures"
@@ -246,4 +254,5 @@ jobs:
             ${{ runner.temp }}/probe.pcap
             ${{ runner.temp }}/probe.log
             ${{ runner.temp }}/probe-failures.log
+            ${{ runner.temp }}/fill.log
             ${{ runner.temp }}/tcpdump.log
