@@ -1,0 +1,98 @@
+name: Telemetry hammer
+
+# Opens fresh QUIC connections to build-telemetry.icerpc.dev through the real build path, with a
+# packet capture on the runner, to catch the connect timeout that CI hits about once in 80 runs.
+
+on:
+  push:
+    branches: [telemetry-hammer]
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: How long to hammer
+        default: "240"
+      interval:
+        description: Seconds to wait between builds
+        default: "2"
+
+env:
+  IceRpcBuildTelemetryDebug: true
+  IceRpcBuildTelemetryDryRun: true
+
+jobs:
+  hammer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: ./.github/actions/setup-dotnet
+      - name: Publish Local Packages
+        run: ./build/publish-local-packages.sh
+      - name: Describe the network
+        run: |
+          echo "egress IP: $(curl -fsS https://checkip.amazonaws.com)"
+          echo "target:    build-telemetry.icerpc.dev -> $(dig +short build-telemetry.icerpc.dev A 2>/dev/null | tr '\n' ' ')"
+          if [ "$RUNNER_OS" = Linux ]; then dpkg -s libmsquic | grep '^Version'; else brew list --versions libmsquic; fi
+        shell: bash
+      - name: Start packet capture
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then iface=any; else iface=$(route -n get default | awk '/interface:/{print $2}'); fi
+          sudo sh -c "tcpdump -i $iface -nn -s 200 -U -Z root -w $RUNNER_TEMP/hammer.pcap 'udp port 4062 or icmp' >$RUNNER_TEMP/tcpdump.log 2>&1 &"
+          sleep 1
+          cat "$RUNNER_TEMP/tcpdump.log"
+        shell: bash
+      - name: Hammer
+        env:
+          MINUTES: ${{ inputs.minutes || 30 }}
+          INTERVAL: ${{ inputs.interval || 2 }}
+        run: |
+          set -u
+          now() { perl -MTime::HiRes=time -MPOSIX=strftime -e '$t=time; printf("%s.%03dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime($t)), ($t-int($t))*1000)'; }
+          IceRpcVersion=$(sed -n 's/.*<Version[^>]*>\(.*\)<\/Version>.*/\1/p' build/IceRpc.Version.props)
+          export IceRpcVersion
+          solution=examples/protobuf/MultipleServices/MultipleServices.slnx
+          log="$RUNNER_TEMP/hammer.log"
+          failures="$RUNNER_TEMP/failures.log"
+          : > "$log"; : > "$failures"
+          end=$(( $(date +%s) + MINUTES * 60 ))
+          i=0; failed=0
+          while [ "$(date +%s)" -lt "$end" ]; do
+            i=$((i + 1))
+            # A newer .proto makes ProtoCompile run protoc again, so every build reports telemetry.
+            touch examples/protobuf/MultipleServices/proto/*/*.proto
+            start=$(now)
+            if out=$(dotnet build "$solution" 2>&1); then status=ok; else status=FAIL; failed=$((failed + 1)); fi
+            finish=$(now)
+            echo "$i $start $finish $status" >> "$log"
+            if [ "$status" = FAIL ]; then
+              printf '=== iteration %s  %s -> %s\n%s\n\n' "$i" "$start" "$finish" "$out" >> "$failures"
+              echo "::warning::iteration $i failed at $start"
+            fi
+            sleep "$INTERVAL"
+          done
+          echo "iterations=$i failed=$failed"
+          [ "$failed" -eq 0 ]
+        shell: bash
+      - name: Stop packet capture
+        if: always()
+        run: |
+          sudo pkill -INT tcpdump || true
+          sleep 2
+          ls -la "$RUNNER_TEMP"/hammer.pcap
+        shell: bash
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hammer-${{ matrix.os }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/hammer.pcap
+            ${{ runner.temp }}/hammer.log
+            ${{ runner.temp }}/failures.log
+            ${{ runner.temp }}/tcpdump.log
