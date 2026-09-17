@@ -104,3 +104,86 @@ jobs:
             ${{ runner.temp }}/hammer.log
             ${{ runner.temp }}/failures.log
             ${{ runner.temp }}/tcpdump.log
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: ./.github/actions/setup-dotnet
+      - name: Build the probe
+        run: dotnet build src/IceRpc.BuildTelemetry.Probe
+      - name: Describe the network
+        run: |
+          echo "egress IP: $(curl -fsS https://checkip.amazonaws.com)"
+          echo "target:    build-telemetry.icerpc.dev -> $(dig +short build-telemetry.icerpc.dev A 2>/dev/null | tr '\n' ' ')"
+          if [ "$RUNNER_OS" = Linux ]; then dpkg -s libmsquic | grep '^Version'; else brew list --versions libmsquic; fi
+        shell: bash
+      - name: Start packet capture
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then iface=any; else iface=$(route -n get default | awk '/interface:/{print $2}'); fi
+          sudo sh -c "tcpdump -i $iface -nn -s 200 -U -Z root -w $RUNNER_TEMP/probe.pcap 'port 4062 or port 53 or icmp' >$RUNNER_TEMP/tcpdump.log 2>&1 &"
+          sleep 1
+          cat "$RUNNER_TEMP/tcpdump.log"
+        shell: bash
+      - name: Probe
+        env:
+          MINUTES: ${{ inputs.minutes || 30 }}
+          INTERVAL: "0.5"
+          PARALLEL: "2"
+        run: |
+          set -u
+          probe="dotnet src/IceRpc.BuildTelemetry.Probe/bin/Debug/net10.0/IceRpc.BuildTelemetry.Probe.dll"
+          log="$RUNNER_TEMP/probe.log"
+          failures="$RUNNER_TEMP/probe-failures.log"
+          : > "$log"; : > "$failures"
+          end=$(( $(date +%s) + MINUTES * 60 ))
+          # One stream of connections, one process each, as the generator does. A failed or slow connect is
+          # followed at once by fresh QUIC flows, a TCP connect, and pings, to tell a dead flow from a dead path
+          # from a dead transport.
+          stream() {
+            while [ "$(date +%s)" -lt "$end" ]; do
+              line=$($probe --timeout 60) || true
+              echo "$line" >> "$log"
+              ms=$(printf '%s' "$line" | sed -n 's/.*connect_ms=\([0-9]*\).*/\1/p')
+              if [ "${line##*result=}" != "ok error=\"\"" ] || [ "${ms:-0}" -gt 2000 ]; then
+                echo "::warning::probe: $line"
+                {
+                  echo "=== $line"
+                  for _ in 1 2 3; do $probe & done
+                  $probe --transport tcp &
+                  ping -c 3 build-telemetry.icerpc.dev &
+                  wait
+                  echo
+                } >> "$failures" 2>&1
+              fi
+              sleep "$INTERVAL"
+            done
+          }
+          for _ in $(seq 1 "$PARALLEL"); do stream & done
+          wait
+          echo "attempts=$(wc -l < "$log") failed=$(grep -c 'result=FAIL' "$log")"
+          [ "$(grep -c 'result=FAIL' "$log")" -eq 0 ]
+        shell: bash
+      - name: Stop packet capture
+        if: always()
+        run: |
+          sudo pkill -INT tcpdump || true
+          sleep 2
+          ls -la "$RUNNER_TEMP"/probe.pcap
+        shell: bash
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: probe-${{ matrix.os }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/probe.pcap
+            ${{ runner.temp }}/probe.log
+            ${{ runner.temp }}/probe-failures.log
+            ${{ runner.temp }}/tcpdump.log
