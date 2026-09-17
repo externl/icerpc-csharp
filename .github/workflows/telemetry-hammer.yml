@@ -322,6 +322,7 @@ jobs:
           : > "$log"
           # One phase per burst size, in sequence on this one runner. The round cadence is scaled by the burst size,
           # so every phase opens the same connections per second and only the burst size differs.
+          # shellcheck disable=SC2086 # SIZES is a list of burst sizes, split on purpose
           set -- $SIZES
           phase_minutes=$(( MINUTES / $# ))
           for burst in $SIZES; do
